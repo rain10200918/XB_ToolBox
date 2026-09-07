@@ -353,6 +353,20 @@ def _resolve_nvml_handle(pynvml, device):
         log.debug("aimdo-viz: nvml uuid match failed: %s", e)
     return pynvml.nvmlDeviceGetHandleByIndex(idx)
 
+# NVML 安装提示只打印一次
+_nvml_warned = {"printed": False}
+
+def _is_nvidia_gpu(device):
+    """判断当前 GPU 是否为 NVIDIA（AMD/ROCm 返回 False）"""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        name = torch.cuda.get_device_name(device)
+        return any(kw in name.lower() for kw in
+                   ["nvidia", "geforce", "rtx", "gtx", "quadro", "tesla", "a100", "h100", "titan"])
+    except Exception:
+        return False
+
 def _nvml_handle(device):
     if _nvml_state["tried"]:
         return _nvml_state["handle"]
@@ -361,6 +375,14 @@ def _nvml_handle(device):
         import pynvml
         pynvml.nvmlInit()
         _nvml_state["handle"] = _resolve_nvml_handle(pynvml, device)
+    except ImportError:
+        # 仅当确实是 NVIDIA GPU 时才提示安装 nvidia-ml-py
+        if _is_nvidia_gpu(device) and not _nvml_warned["printed"]:
+            _nvml_warned["printed"] = True
+            print("[XB 硬件监控] [HINT] 检测到 NVIDIA GPU，但缺少 NVML 依赖 (pynvml)。")
+            print("  如需显示 GPU 温度/利用率/功耗，请安装: pip install nvidia-ml-py")
+            print("  AMD GPU 用户无需安装此包，请忽略该提示。")
+        log.debug("aimdo-viz: pynvml not installed")
     except Exception as e:
         log.debug("aimdo-viz: pynvml init failed: %s", e)
     return _nvml_state["handle"]
@@ -391,6 +413,43 @@ def _nvml_power_limit(device):
         return _nvml_state["power_limit"]
     except Exception as e:
         log.debug("aimdo-viz: nvmlDeviceGetPowerManagementLimit failed: %s", e)
+        return None
+
+def _nvml_utilization(device):
+    """NVML GPU 利用率 (%)"""
+    h = _nvml_handle(device)
+    if h is None:
+        return None
+    try:
+        import pynvml
+        rates = pynvml.nvmlDeviceGetUtilizationRates(h)
+        return rates.gpu  # 0-100
+    except Exception as e:
+        log.debug("aimdo-viz: nvmlDeviceGetUtilizationRates failed: %s", e)
+        return None
+
+def _nvml_temperature(device):
+    """NVML GPU 温度 (°C)"""
+    h = _nvml_handle(device)
+    if h is None:
+        return None
+    try:
+        import pynvml
+        return pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+    except Exception as e:
+        log.debug("aimdo-viz: nvmlDeviceGetTemperature failed: %s", e)
+        return None
+
+def _nvml_power_draw(device):
+    """NVML GPU 实时功耗 (mW)"""
+    h = _nvml_handle(device)
+    if h is None:
+        return None
+    try:
+        import pynvml
+        return pynvml.nvmlDeviceGetPowerUsage(h)  # mW
+    except Exception as e:
+        log.debug("aimdo-viz: nvmlDeviceGetPowerUsage failed: %s", e)
         return None
 
 def _get_lock():
@@ -767,6 +826,16 @@ async def aimdo_vram_status(request):
     except Exception:
         gpu_power = None
     gpu_power_limit = _nvml_power_limit(device)  # mW
+
+    # ── NVIDIA 回退方案 ──
+    # torch.cuda.utilization/temperature/power_draw 内部依赖 pynvml，
+    # 未安装 pynvml 时会返回 None，这里直接用 NVML 查询回退。
+    if gpu_util is None:
+        gpu_util = _nvml_utilization(device)
+    if gpu_temp is None:
+        gpu_temp = _nvml_temperature(device)
+    if gpu_power is None:
+        gpu_power = _nvml_power_draw(device)
 
     # ── AMD/ROCm 回退方案 ──
     # 当 NVIDIA 专有 API 返回 None 时（AMD 显卡），尝试 rocm-smi
